@@ -18,7 +18,7 @@ require 'flash_find/version'
 # objects, which primarily delegate to the underlying `File::Stat` object.
 #
 # To get the filename, call `#path` or `#to_s`.  To check if there was an error
-# stating this entry, check `#error?`, and retrieve it with `#error`.
+# lstating this entry, check `#error?`, and retrieve it with `#error`.
 #
 # ==== Example
 #
@@ -28,19 +28,35 @@ require 'flash_find/version'
 #            .permit {|entry| entry.readable? }
 #            .each { |entry| p entry }
 #
+# Each call to query method like `#prune` and `#push` returns a new object,
+# wrapping the current one and inheriting its existing directories and filters.
+#
+# This lets you build custom trees of different finders with desired behaviour:
+#
+#    FailSafeFind = FlashFind.skip_errors
+#    CodeSafeFind = FailSafeFind.prune_directory('.git', '.hg', '.svn')
+#    FooFind = CodeSafeFind.push('src/foo')
+#    CodeSafeFindToo = FooFind.parent
 
 require 'logger'
 
 module FlashFind
 	Log = Logger.new STDERR
-	# DirEntry wraps File::Stat with additional information such as filename and
-	# optional lstat error information.
+	# DirEntry delegates to `Pathname` and `File::Stat` to provide useful query and
+	# path manipulation functionality bundled together.
+	#
+	#    FlashFind.push('bin').each do |entry|
+	#      entry.path      # => 'bin/console'
+	#      entry.file?     # => true
+	#      entry.basename  # => 'console'
+	#      entry.dirname   # => 'bin'
+	#    end
 	class DirEntry
 		extend Forwardable
 		def_delegators :@pathname, *Pathname.public_instance_methods(false)
 		def_delegators :@stat, *File::Stat.public_instance_methods(false)
 
-		attr_reader :path, :stat, :error
+		attr_reader :path, :stat, :error, :dir
 		alias_method :to_s, :path
 		alias_method :name, :path
 		alias_method :exception, :error
@@ -49,6 +65,7 @@ module FlashFind
 			@path = path
 			@pathname = Pathname.new(path)
 			@stat = @stat || File.lstat(path)
+			@dir = Dir.new(path) if @stat && @stat.directory?
 			@error = error
 		rescue => e
 			@error = e
@@ -81,64 +98,78 @@ module FlashFind
 	end
 
 	class << self
-		def push(*dirs)
-			Finder.new.push(*dirs)
+		def self.del(*meths)
+			meths.each do |meth|
+				define_method(meth) do |*args|
+					Finder.new.send(meth, *args)
+				end
+			end
 		end
+
+		def self.del_block(*meths)
+			meths.each do |meth|
+				define_method(meth) do |*args, &block|
+					Finder.new.send(meth, *args, &block)
+				end
+			end
+		end
+
+		del :push, :prune, :raise_errors, :skip_errors, :prune_directory
+		del_block :prune, :permit
 	end
 
 	# Core class
 	class Finder
 		include Enumerable
 
-		attr :filter, :dirs
-		attr_reader :job_queue
+		attr_reader :filter, :dirs
+		attr_reader :job_queue, :parent
 
 		def initialize
-			@dirs    = Set.new
-			@filter  = []
+			@parent  = nil
+			@dirs    = []
+			@filter  = nil
 			@lock    = Mutex.new
 			@working = Concurrent::AtomicFixnum.new
+		end
+
+		# Return an array of starting point directories.
+		def dirs
+			@i_dirs ||= if parent
+				parent.dirs + @dirs
+			else
+				@dirs
+			end.freeze
+		end
+
+		# Return an Array of filters
+		def filters
+			@filters ||= if parent
+				parent.filters.dup << filter
+			else
+				[filter]
+			end.compact.freeze
 		end
 
 		# Add a set of paths to the list to start the directory walk from.
 		#
 		# Dereferenced with `#to_path` if necessary.
 		def push(*dirs)
-			dirs.flatten.each do |dir|
-				dir = dir.to_path if dir.respond_to?(:to_path)
-				@dirs << dir.dup
-			end
-			self
-		end
-
-		# Silently skip over erroring entries.
-		def skip_errors
-			prune(&:error?)
-		end
-
-		# Raise an error rather than allow iteration to continue.
-		def raise_errors
-			prune { |entry| fail Error.new(entry) if entry.error? }
-		end
-
-		def prune_directory(basename)
-			prune { |entry| entry.directory? && entry.basename.to_s == basename }
+			Push.new(self, dirs)
 		end
 
 		# Add a block that must return truthy to allow further processing.
 		#
 		# May run concurrently in background threads.
 		def permit(&block)
-			@filter << Permit.new(block)
-			self
+			Permit.new(self, block)
 		end
 
 		# Add a block that must return falsey to allow further procesing.
 		#
 		# May run concurrently in background threads.
 		def prune(&block)
-			@filter << Prune.new(block)
-			self
+			Prune.new(self, block)
 		end
 		# alias_method :prune, :reject
 
@@ -149,6 +180,7 @@ module FlashFind
 			run {|runner| runner.each(&block) }
 		end
 
+		# Begin iterating using a pool of worker threads for `#each` as well.
 		def concurrent_each(concurrency: Concurrent.processor_count, &block)
 			return enum_for(__method__, concurrency: concurrency) unless block_given?
 
@@ -165,6 +197,21 @@ module FlashFind
 			end
 		end
 
+		# Silently skip over erroring entries.
+		def skip_errors
+			prune(&:error?)
+		end
+
+		# Raise an error rather than allow iteration to continue.
+		def raise_errors
+			prune { |entry| fail Error.new(entry) if entry.error? }
+		end
+
+		# Prune a directory with the given basename
+		def prune_directory(basename)
+			prune { |entry| entry.directory? && entry.basename.to_s == basename }
+		end
+
 		private
 
 		def run
@@ -179,8 +226,8 @@ module FlashFind
 				@job_queue ||= Queue.new
 				@concurrency = 8 # [Concurrent.processor_count, 32].max
 
-				if !@workers
-					@workers ||= Concurrent::FixedThreadPool.new(@concurrency)
+				unless @workers
+					@workers = Concurrent::FixedThreadPool.new(@concurrency)
 					@concurrency.times do
 						@workers.post do
 							DirectoryWalker.new(@job_queue).run
@@ -198,21 +245,42 @@ module FlashFind
 			@lock.synchronize { yield }
 		end
 
-		class Filter # :nodoc:
-			def initialize(block)
-				@block = block
+		class Push < Finder
+			def initialize(parent, dirs)
+				super()
+				@parent = parent
+				@dirs = dirs.flatten.map do |dir|
+					dir = dir.to_path if dir.respond_to?(:to_path)
+					dir.dup
+				end
+
+				dirs
 			end
 		end
 
-		class Permit < Filter # :nodoc:
-			def apply?(entry)
-				@block.call(entry)
+		class Filter < Finder
+			def initialize(parent, block)
+				super()
+				@parent = parent
+				@filter = wrap(block)
+
+				filters
 			end
 		end
 
-		class Prune < Filter # :nodoc:
-			def apply?(entry)
-				!@block.call(entry)
+		class Permit < Filter
+			private
+
+			def wrap(entry)
+				entry
+			end
+		end
+
+		class Prune < Filter
+			private
+
+			def wrap(block)
+				->(entry) { !block.call(entry) }
 			end
 		end
 
@@ -233,14 +301,14 @@ module FlashFind
 			def run
 				return unless @running.make_true
 
-				finder.dirs.each_slice(256) do |entries|
+				finder.dirs.each_slice(16) do |entries|
 					pending!
 					workers << Job.new(:stat, self, entries)
 				end
 			end
 
-			def filter
-				finder.filter
+			def filters
+				finder.filters
 			end
 
 			def pending!
@@ -254,8 +322,7 @@ module FlashFind
 				if running.true?
 					@results << result if result
 					if @pending.decrement.zero?
-						@results << nil
-						[@concurrency, @iterators.value].max.times { @results << nil }
+						[1, @concurrency, @iterators.value].max.times { @results << nil }
 					end
 				end
 			end
@@ -308,13 +375,15 @@ module FlashFind
 				end
 			end
 
+			private
+
 			def enqueue(job)
 				@queue << job if job.runner.pending!
 			end
 
 			def stat(job)
 				entries = job.args.map {|file| DirEntry.new(file) }.select do |entry|
-					job.runner.filter.all? {|filter| filter.apply?(entry) }
+					job.runner.filters.all? {|filter| filter.call(entry) }
 				end
 
 				entries.select(&:directory?).each {|dir| enqueue(Job.new(:dir, job.runner, dir)) }
@@ -323,17 +392,13 @@ module FlashFind
 
 			def dir(job)
 				path = job.args
-				entries(path).each_slice(16) do |ents|
-					enqueue(Job.new(:stat, job.runner, ents.map {|ent| File.join(path, ent) }))
+				if path.readable?
+					entries = path.entries.drop(2)
+					entries.each_slice([entries.size / 32, 8].max) do |ents|
+						enqueue(Job.new(:stat, job.runner, ents.map {|ent| File.join(path, ent) }))
+					end
 				end
 				job.runner.yield nil
-			end
-
-			private
-
-			IgnoreDirs = ['.'.freeze, '..'.freeze].freeze
-			def entries(path)
-				Dir.entries(path) - IgnoreDirs
 			end
 		end
 	end
