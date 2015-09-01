@@ -1,0 +1,91 @@
+#!/usr/bin/env ruby
+
+require "bundler/setup"
+require "flash_find"
+Bundler.setup(:default)
+
+Thread.abort_on_exception = true
+
+require 'benchmark'
+require 'find'
+require 'fast_find'
+
+FDIR = '/home/freaky/Maildir/.zfs/snapshot/replicate.yau.2015-08-29T17:43:38Z/'
+
+def count_files_flashfind(dir)
+	entries = 0
+	bytes = 0
+	FlashFind.push(FDIR)
+	         .prune {|entry| entry.directory? && entry.basename.to_s == '.git' }
+	         .each do |entry|
+	         	entries += 1
+	         	bytes += entry.size if entry.file?
+	end
+	[entries, bytes]
+end
+
+def count_files_flashfind_concurrent(dir)
+	entries = Concurrent::AtomicFixnum.new
+	bytes = Concurrent::AtomicFixnum.new
+	FlashFind.push(FDIR)
+	         .prune {|entry| entry.directory? && entry.basename.to_s == '.git' }
+	         .concurrent_each do |entry|
+	         	entries.increment
+	         	bytes.increment(entry.size) if entry.file?
+	end
+	[entries.value, bytes.value]
+end
+
+def count_files_find(dir)
+	entries = 0
+	bytes = 0
+	Find.find(dir) do |path|
+		stat = File.lstat(path)
+		Find.prune if stat.directory? && File.basename(path) == '.git'
+
+		entries += 1
+		bytes += stat.size if stat.file?
+	end
+	[entries, bytes]
+end
+
+def count_files_fastfind(dir)
+	entries = 0
+	bytes = 0
+	FastFind.find(dir) do |path, stat|
+		FastFind.prune if stat.directory? && File.basename(path) == '.git'
+
+		entries += 1
+		bytes += stat.size if stat.file?
+	end
+	[entries, bytes]
+end
+
+counts = Hash.new
+Benchmark.bmbm do |b|
+	b.report("FlashFind") do
+		counts['FlashFind'] = count_files_flashfind(FDIR)
+	end
+
+	b.report("FlashFind#concurrent_each") do
+		counts['FlashFind#concurrent_each'] = count_files_flashfind_concurrent(FDIR)
+	end
+
+	b.report("FastFind") do
+		counts['FastFind'] = count_files_fastfind(FDIR)
+	end
+
+	b.report("Find") do
+		counts['Find'] = count_files_find(FDIR)
+	end
+end
+
+at_exit do
+	diffs = Hash[counts.group_by {|k,v| v }.map {|k,v| [k, v.map(&:first)] }]
+	if diffs.size > 1
+		puts "Unequal counts: #{diffs}"
+	else
+		files, bytes = diffs.keys.first
+		puts "All counted #{files} files and #{bytes} bytes"
+	end
+end
