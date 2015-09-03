@@ -65,7 +65,7 @@ module FlashFind
 			@path = path
 			@pathname = Pathname.new(path)
 			@stat = @stat || File.lstat(path)
-			@dir = Dir.new(path) if @stat && @stat.directory?
+			@dir = Dir.new(path) if @stat && @stat.readable? && @stat.directory?
 			@error = error
 		rescue => e
 			@error = e
@@ -118,6 +118,70 @@ module FlashFind
 		del_block :prune, :permit
 	end
 
+	Job = Struct.new(:action, :runner, :args)
+
+	MAX_THREADS    = 8
+	ThreadPool     = Concurrent::CachedThreadPool.new(min_threads: 0, max_threads: MAX_THREADS)
+	PoolQueue      = Queue.new
+	SpunUp         = Concurrent::AtomicBoolean.new
+	Active         = Concurrent::AtomicFixnum.new
+	LastActive     = Concurrent::AtomicReference.new
+	CooldownThread = Concurrent::AtomicReference.new
+	RWLock = Concurrent::ReadWriteLock.new
+
+	class DirectoryWalker
+		def run
+			while job = PoolQueue.deq
+				if job.is_a? Concurrent::CountDownLatch
+					job.count_down
+					break
+				end
+
+				run_job(job)
+			end
+		end
+
+		def run_job(job)
+			begin
+				case job.action
+				when :stat then stat(job)
+				when :dir then dir(job)
+				else raise ArgumentError, "Unknown job type: #{job.inspect}"
+				end
+			rescue => e
+				Log.error e
+				job.runner.yield e
+			end
+		end
+
+		private
+
+		def enqueue(job)
+			PoolQueue << job if job.runner.pending!
+		end
+
+		def stat(job)
+			entries = job.args.map {|file| DirEntry.new(file) }.select do |entry|
+				job.runner.filters.all? {|filter| filter.call(entry) }
+			end
+
+			entries.reject(&:error?).select(&:directory?).each {|dir| enqueue(Job.new(:dir, job.runner, dir)) }
+			job.runner.yield entries
+		end
+
+		def dir(job)
+			path = job.args
+			if path.readable?
+				entries = path.entries.drop(2) # Drop . and ..
+				entries.each_slice([entries.size / 32, 8].max) do |ents|
+					enqueue(Job.new(:stat, job.runner, ents.map {|ent| File.join(path, ent) }))
+				end
+			end
+			job.runner.yield :dir
+		end
+	end
+	PoolJob = DirectoryWalker.new
+
 	# Core class
 	class Finder
 		include Enumerable
@@ -126,6 +190,7 @@ module FlashFind
 		attr_reader :job_queue, :parent
 
 		def initialize
+			@concurrency = RUBY_ENGINE == 'ruby' ? 1 : 8
 			@parent  = nil
 			@dirs    = []
 			@filter  = nil
@@ -135,8 +200,8 @@ module FlashFind
 
 		# Return an array of starting point directories.
 		def dirs
-			@i_dirs ||= if parent
-				parent.dirs + @dirs
+			@_dirs ||= if parent
+				parent.dirs.to_a + @dirs
 			else
 				@dirs
 			end.freeze
@@ -199,7 +264,15 @@ module FlashFind
 
 		# Silently skip over erroring entries.
 		def skip_errors
-			prune(&:error?)
+			SkipError.new(prune(&:error?))
+		end
+
+		def skip_errors?
+			@_skip_errors ||= if parent
+				parent.skip_errors? || @skip_errors
+			else
+				@skip_errors
+			end
 		end
 
 		# Raise an error rather than allow iteration to continue.
@@ -215,30 +288,81 @@ module FlashFind
 		private
 
 		def run
-			work_pool do |workers|
-				yield Runner.new(self, workers)
+			working do
+				yield Runner.new(self)
 			end
 		end
 
-		def work_pool
-			@working.increment
-			lock do
-				@job_queue ||= Queue.new
-				@concurrency = 8 # [Concurrent.processor_count, 32].max
+		# Only call with Active == 1
+		def spinup_workers
+			LastActive.set(time)
+			RWLock.with_write_lock do
+				return if SpunUp.true?
 
-				unless @workers
-					@workers = Concurrent::FixedThreadPool.new(@concurrency)
-					@concurrency.times do
-						@workers.post do
-							DirectoryWalker.new(@job_queue).run
+				MAX_THREADS.times do
+					ThreadPool.post do
+						DirectoryWalker.new.run
+					end
+				end
+
+				SpunUp.make_true
+			end
+		end
+
+		# Only call with Active = 0
+		def spindown_workers
+			RWLock.with_write_lock do
+				thr = CooldownThread.get
+				if thr
+					return if thr.alive?
+
+					thr.join
+					CooldownThread.set(nil)
+				end
+
+				thr = Thread.new do
+					loop do
+						wakeup = time + POOL_SHUTDOWN_PERIOD + 1
+
+						while (remaining = wakeup - time) > 0
+							sleep remaining
+						end
+
+						RWLock.with_write_lock do
+							if Active.value.zero? && time - LastActive.get >= POOL_SHUTDOWN_PERIOD
+								SpunUp.make_false
+								latch = Concurrent::CountDownLatch.new(MAX_THREADS)
+								MAX_THREADS.times { PoolQueue.enq latch }
+								latch.wait
+								Thread.exit
+							end
 						end
 					end
 				end
-			end
 
-			yield(@job_queue)
+				CooldownThread.set thr
+			end
+		end
+
+		POOL_SHUTDOWN_PERIOD = 2
+		def working
+			if Active.increment == 1
+				spinup_workers
+			end
+			@working.increment
+			RWLock.with_read_lock { yield }
 		ensure
 			@working.decrement
+			now = time
+			LastActive.set(now)
+
+			if Active.decrement.zero?
+				spindown_workers
+			end
+		end
+
+		def time
+			Process.clock_gettime(Process::CLOCK_MONOTONIC)
 		end
 
 		def lock
@@ -268,6 +392,12 @@ module FlashFind
 			end
 		end
 
+		class SkipError < Finder
+			def initialize(parent)
+				@skip_errors = true
+			end
+		end
+
 		class Permit < Filter
 			private
 
@@ -288,14 +418,13 @@ module FlashFind
 			attr_reader :finder, :workers, :results, :running
 			attr_accessor :concurrency
 
-			def initialize(finder, workers)
-				@concurrency = 1
-				@finder = finder
-				@workers = workers
-				@results = Queue.new
+			def initialize(finder)
+				@concurrency = 8
+				@finder    = finder
+				@results   = Queue.new
 				@iterators = Concurrent::AtomicFixnum.new
-				@pending = Concurrent::AtomicFixnum.new
-				@running = Concurrent::AtomicBoolean.new
+				@pending   = Concurrent::AtomicFixnum.new
+				@running   = Concurrent::AtomicBoolean.new
 			end
 
 			def run
@@ -303,7 +432,7 @@ module FlashFind
 
 				finder.dirs.each_slice(16) do |entries|
 					pending!
-					workers << Job.new(:stat, self, entries)
+					PoolQueue << Job.new(:stat, self, entries)
 				end
 			end
 
@@ -335,9 +464,10 @@ module FlashFind
 				nresults = 0
 				while result = @results.deq
 					case result
-					when Array     then result.each {|entry| yield(entry) }
+					when Array     then result.compact.each {|entry| yield(entry) }
 					when DirEntry  then yield(entry)
-					when Exception then raise result
+					when Exception then raise result unless finder.skip_errors?
+					when :dir then next
 					else Log.warn "Unhandled result: #{result}"
 					end
 				end
@@ -347,58 +477,6 @@ module FlashFind
 					@results.clear
 					@running.make_false
 				end
-			end
-		end
-
-		Job = Struct.new(:action, :runner, :args)
-
-		class DirectoryWalker
-			attr_reader :queue
-			attr_reader :thread
-
-			def initialize(queue)
-				@queue = queue
-			end
-
-			def run
-				while job = queue.deq
-					begin
-						case job.action
-						when :stat then stat(job)
-						when :dir then dir(job)
-						else raise ArgumentError, "Unknown job type: #{job.inspect}"
-						end
-					rescue => e
-						Log.error e
-						job.runner.yield e
-					end
-				end
-			end
-
-			private
-
-			def enqueue(job)
-				@queue << job if job.runner.pending!
-			end
-
-			def stat(job)
-				entries = job.args.map {|file| DirEntry.new(file) }.select do |entry|
-					job.runner.filters.all? {|filter| filter.call(entry) }
-				end
-
-				entries.select(&:directory?).each {|dir| enqueue(Job.new(:dir, job.runner, dir)) }
-				job.runner.yield entries
-			end
-
-			def dir(job)
-				path = job.args
-				if path.readable?
-					entries = path.entries.drop(2)
-					entries.each_slice([entries.size / 32, 8].max) do |ents|
-						enqueue(Job.new(:stat, job.runner, ents.map {|ent| File.join(path, ent) }))
-					end
-				end
-				job.runner.yield nil
 			end
 		end
 	end

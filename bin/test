@@ -9,11 +9,56 @@ Thread.abort_on_exception = true
 require 'benchmark'
 require 'find'
 require 'fast_find'
+require 'tmpdir'
+require 'securerandom'
+require 'set'
 
 TESTDIRS = {
 	'Maildir' => '/home/freaky/Maildir/.zfs/snapshot/replicate.yau.2015-08-29T17:43:38Z/.spam.high',
-	'CVS' => '/cvs/netbsd/pkgsrc'
+	'CVS' => '/cvs/netbsd/pkgsrc',
+	'git' => '/home/freaky/code/jruby'
 }
+
+def random_name(dir)
+	File.join(dir, SecureRandom.base64(18).tr('/'.freeze, '_'.freeze))
+end
+
+def fill_dir(dir, files = 0..4, dirs = 2..4, max_depth = 4, depth = 0)
+	entries = []
+	entries << dir if depth == 0
+	names = Array.new(rand(files)).map { random_name(dir) }
+	entries.concat names
+	names.each do |name|
+		IO.write(name, "".freeze)
+	end
+
+	if depth <= max_depth
+		names = Array.new(rand(dirs)).map { random_name(dir) }
+		entries.concat names
+
+		names.each do |name|
+			Dir.mkdir(name)
+			entries.concat fill_dir(name, files, dirs, max_depth, depth + 1)
+		end
+	end
+	entries.flatten
+end
+
+def flashfind_test
+	Dir.mktmpdir do |dir|
+		tree = fill_dir(dir)
+
+		compare_tree(FlashFind.push(dir), Set.new(tree))
+	end
+end
+
+def compare_tree(find, tree)
+	found = find.each.map(&:path)
+	a, b = found.sort, tree.to_a.sort
+	if (diff = (a - b) + (b - a)).any?
+		puts "FAIL: #{diff.inspect}"
+	end
+end
 
 def count_files_flashfind(dir)
 	entries = 0
@@ -79,6 +124,10 @@ Benchmark.bmbm do |b|
 		'Find'            => ->(dir) { count_files_find(dir) }
 	}
 
+	b.report("test") do
+		flashfind_test
+	end
+
 	TESTDIRS.each do |type, dir|
 		methods.each do |meth, action|
 			name = "#{meth}(#{type})"
@@ -91,17 +140,11 @@ end
 
 at_exit do
 	diffs = Hash[counts.group_by {|k,v| v }.map {|k,v| [k, v.map(&:first)] }]
-	if diffs.size > 2
+	if diffs.size != TESTDIRS.size
 		puts "Unequal counts: #{diffs}"
 	else
 		diffs.each do |files_bytes, names|
 			puts "%d files in %d bytes: %s" % [*files_bytes, names.join(', ')]
 		end
-		# diffs.each do |group, names|
-		# 	names.each do |name|
-		# 	files, bytes = diffs.keys.first
-		# 	puts "Counted #{files} files and #{bytes} bytes"
-		# end
-		# end
 	end
 end
